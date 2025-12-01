@@ -34,4 +34,8 @@ impl VectorStorage for InMemoryStorage {
     fn len(&self) -> usize {
         self.data.len()
     }
+
+    fn dim(&self) -> Option<usize> {
+        self.data.first().map(|v| v.len())
+    }
 }

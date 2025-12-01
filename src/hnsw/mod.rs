@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use rand::{Rng, thread_rng};
+use rayon::prelude::*;
 
 use crate::distance::{cosine_distance, l2};
 use crate::storage::{InMemoryStorage, VectorStorage};
@@ -105,6 +106,18 @@ impl<S: VectorStorage> HnswIndex<S> {
             nodes: HashMap::new(),
             storage,
         }
+    }
+
+    /// Parallel search for many queries using rayon.
+    pub fn search_batch_parallel<I>(&self, queries: I, k: usize) -> Vec<Vec<Neighbor>>
+    where
+        I: rayon::iter::IntoParallelIterator<Item = Vec<f32>>,
+        S: Sync,
+    {
+        queries
+            .into_par_iter()
+            .map(|q| self.search(&q, k))
+            .collect()
     }
 
     /// Insert a vector; returns its id.
@@ -332,6 +345,20 @@ mod tests {
         let res = idx.search(&[1.1, 1.0], 2);
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].id, 1);
+    }
+
+    #[test]
+    fn batch_parallel_searches_return_results() {
+        let mut idx = HnswIndex::new(8, 16, 16, 32, Metric::L2, InMemoryStorage::new());
+        for i in 0..20 {
+            idx.insert(vec![i as f32, 0.0]);
+        }
+        let queries: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32 + 0.3, 0.0]).collect();
+        let results = idx.search_batch_parallel(queries, 1);
+        assert_eq!(results.len(), 5);
+        for (i, res) in results.iter().enumerate() {
+            assert_eq!(res[0].id, i);
+        }
     }
 }
 
