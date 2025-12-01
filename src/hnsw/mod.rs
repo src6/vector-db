@@ -1,6 +1,11 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter};
+use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 use rand::{Rng, thread_rng};
 
 use crate::distance::{cosine_distance, l2};
@@ -36,6 +41,7 @@ impl Ord for ScoredPoint {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub layers: Vec<Vec<PointId>>, // index by layer
 }
@@ -65,6 +71,8 @@ fn sort_by_distance(mut items: Vec<ScoredPoint>) -> Vec<ScoredPoint> {
     items
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound = "S: Serialize + DeserializeOwned")]
 pub struct HnswIndex<S: VectorStorage = InMemoryStorage> {
     pub m: usize,
     pub m_max0: usize,
@@ -115,8 +123,12 @@ impl<S: VectorStorage> HnswIndex<S> {
         let mut entry = self.entry_point.unwrap();
         if level < self.entry_point_level {
             for l in (level + 1..=self.entry_point_level).rev() {
-                let candidates =
-                    self.search_layer_internal(entry, l, self.storage.get(id).unwrap(), 1);
+                let candidates = self.search_layer_internal(
+                    entry,
+                    l,
+                    self.storage.get(id).unwrap().as_ref(),
+                    1,
+                );
                 if let Some(best) = candidates.first() {
                     entry = best.id;
                 }
@@ -126,8 +138,12 @@ impl<S: VectorStorage> HnswIndex<S> {
         // Insert connections layer by layer down to 0.
         for l in (0..=level).rev() {
             let ef = self.ef_construction;
-            let candidates =
-                self.search_layer_internal(entry, l, self.storage.get(id).unwrap(), ef);
+            let candidates = self.search_layer_internal(
+                entry,
+                l,
+                self.storage.get(id).unwrap().as_ref(),
+                ef,
+            );
             let max_m = if l == 0 { self.m_max0 } else { self.m };
             let neighbors = self.select_neighbors(candidates, max_m);
 
@@ -202,8 +218,10 @@ impl<S: VectorStorage> HnswIndex<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::storage::{InMemoryStorage, QuantizedStorage, ScalarQuantizerConfig};
     use rand::{Rng, SeedableRng, rngs::StdRng};
+    use std::env;
+    use std::fs;
 
     fn brute_force(query: &[f32], vectors: &[Vec<f32>], k: usize) -> Vec<PointId> {
         let mut scored: Vec<(PointId, f32)> = vectors
@@ -283,6 +301,38 @@ mod tests {
             assert!(h_ids.contains(&id));
         }
     }
+
+    #[test]
+    fn persistence_round_trip() {
+        let mut idx = HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new());
+        idx.insert(vec![0.0, 0.0]);
+        idx.insert(vec![1.0, 0.0]);
+        idx.insert(vec![0.0, 1.0]);
+
+        let path = env::temp_dir().join("vector-db-hnsw.json");
+        idx.save_to_json(&path).expect("save");
+        let loaded: HnswIndex<InMemoryStorage> =
+            HnswIndex::load_from_json(&path).expect("load");
+        let _ = fs::remove_file(&path);
+
+        let res = loaded.search(&[0.9, 0.1], 2);
+        assert!(!res.is_empty());
+    }
+
+    #[test]
+    fn quantized_storage_searches() {
+        let sample = vec![vec![0.0f32, 0.0], vec![2.0, 2.0]];
+        let cfg = ScalarQuantizerConfig::from_sample(&sample).unwrap();
+        let store = QuantizedStorage::new(cfg);
+        let mut idx = HnswIndex::new(8, 16, 32, 32, Metric::L2, store);
+        let points = vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 2.0]];
+        for p in points {
+            idx.insert(p);
+        }
+        let res = idx.search(&[1.1, 1.0], 2);
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].id, 1);
+    }
 }
 
 impl<S: VectorStorage> HnswIndex<S> {
@@ -306,7 +356,7 @@ impl<S: VectorStorage> HnswIndex<S> {
         let mut result = BinaryHeap::new(); // max-heap, keeps worst on top
 
         if let Some(vec) = self.storage.get(entry_id) {
-            let dist = self.distance(query, vec);
+            let dist = self.distance(query, vec.as_ref());
             let ep = ScoredPoint {
                 id: entry_id,
                 distance: dist,
@@ -328,7 +378,7 @@ impl<S: VectorStorage> HnswIndex<S> {
                         continue;
                     }
                     if let Some(vec) = self.storage.get(n_id) {
-                        let d = self.distance(query, vec);
+                        let d = self.distance(query, vec.as_ref());
                         let sp = ScoredPoint {
                             id: n_id,
                             distance: d,
@@ -367,7 +417,7 @@ impl<S: VectorStorage> HnswIndex<S> {
             let mut good = true;
             for &sid in &selected {
                 if let Some(sel_vec) = self.storage.get(sid) {
-                    let dist = self.distance(cand_vec, sel_vec);
+                    let dist = self.distance(cand_vec.as_ref(), sel_vec.as_ref());
                     if dist < cand.distance {
                         good = false;
                         break;
@@ -420,7 +470,7 @@ impl<S: VectorStorage> HnswIndex<S> {
             .filter_map(|nid| {
                 self.storage.get(nid).map(|v| ScoredPoint {
                     id: nid,
-                    distance: self.distance(src_vec, v),
+                    distance: self.distance(src_vec.as_ref(), v.as_ref()),
                 })
             })
             .collect();
@@ -428,6 +478,27 @@ impl<S: VectorStorage> HnswIndex<S> {
         scored.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
         scored.truncate(max_m);
         scored.into_iter().map(|s| s.id).collect()
+    }
+}
+
+impl<S> HnswIndex<S>
+where
+    S: VectorStorage + Serialize + DeserializeOwned,
+{
+    /// Save the index (graph + storage) to a JSON file.
+    pub fn save_to_json<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize: {e}")))
+    }
+
+    /// Load an index previously saved with `save_to_json`.
+    pub fn load_from_json<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        serde_json::from_reader(reader)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("deserialize: {e}")))
     }
 }
 

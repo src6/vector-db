@@ -1,6 +1,9 @@
 use super::VectorStorage;
 use crate::types::PointId;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InMemoryStorage {
     data: Vec<Vec<f32>>,
 }
@@ -24,8 +27,8 @@ impl VectorStorage for InMemoryStorage {
         id
     }
 
-    fn get(&self, id: PointId) -> Option<&[f32]> {
-        self.data.get(id).map(|v| v.as_slice())
+    fn get(&self, id: PointId) -> Option<Cow<'_, [f32]>> {
+        self.data.get(id).map(|v| Cow::Borrowed(v.as_slice()))
     }
 
     fn len(&self) -> usize {
