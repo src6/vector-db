@@ -25,7 +25,7 @@ impl MmapStorage {
         let bytes = capacity
             .checked_mul(dim)
             .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "capacity overflow"))?;
+            .ok_or_else(|| io::Error::other("capacity overflow"))?;
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -99,7 +99,12 @@ impl Serialize for MmapStorage {
     where
         S: serde::Serializer,
     {
-        let state = (self.path.to_string_lossy(), self.dim, self.capacity, self.len);
+        let state = (
+            self.path.to_string_lossy(),
+            self.dim,
+            self.capacity,
+            self.len,
+        );
         state.serialize(serializer)
     }
 }
@@ -123,8 +128,8 @@ impl<'de> Deserialize<'de> for MmapStorage {
             .map_err(serde::de::Error::custom)?;
         file.set_len(bytes as u64)
             .map_err(serde::de::Error::custom)?;
-        let mmap = unsafe { MmapOptions::new().map_mut(&file) }
-            .map_err(serde::de::Error::custom)?;
+        let mmap =
+            unsafe { MmapOptions::new().map_mut(&file) }.map_err(serde::de::Error::custom)?;
         Ok(Self {
             path,
             dim,

@@ -1,8 +1,8 @@
 use crate::hnsw::HnswIndex;
 use crate::storage::VectorStorage;
 use crate::types::{Neighbor, PointId};
-use std::sync::{Arc, RwLock};
 use rayon::prelude::*;
+use std::sync::{Arc, RwLock};
 
 /// Thread-safe wrapper around `HnswIndex` using coarse-grained locking.
 #[derive(Clone)]
@@ -30,10 +30,7 @@ where
     where
         I: IntoParallelIterator<Item = Vec<f32>>,
     {
-        vectors
-            .into_par_iter()
-            .map(|v| self.insert(v))
-            .collect()
+        vectors.into_par_iter().map(|v| self.insert(v)).collect()
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
@@ -45,7 +42,10 @@ where
     where
         I: IntoParallelIterator<Item = Vec<f32>>,
     {
-        queries.into_par_iter().map(|q| self.search(&q, k)).collect()
+        queries
+            .into_par_iter()
+            .map(|q| self.search(&q, k))
+            .collect()
     }
 
     pub fn len(&self) -> usize {

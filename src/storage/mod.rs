@@ -1,10 +1,10 @@
 mod in_memory;
-mod quantized;
 mod mmap;
+mod quantized;
 
 pub use in_memory::InMemoryStorage;
-pub use quantized::{QuantizedStorage, ScalarQuantizerConfig};
 pub use mmap::MmapStorage;
+pub use quantized::{QuantizedStorage, ScalarQuantizerConfig};
 
 use crate::types::PointId;
 use std::borrow::Cow;

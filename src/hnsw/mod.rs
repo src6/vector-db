@@ -4,10 +4,10 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-use serde::de::DeserializeOwned;
 use rand::{Rng, thread_rng};
 use rayon::prelude::*;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::distance::{cosine_distance, l2};
 use crate::storage::{InMemoryStorage, VectorStorage};
@@ -136,12 +136,8 @@ impl<S: VectorStorage> HnswIndex<S> {
         let mut entry = self.entry_point.unwrap();
         if level < self.entry_point_level {
             for l in (level + 1..=self.entry_point_level).rev() {
-                let candidates = self.search_layer_internal(
-                    entry,
-                    l,
-                    self.storage.get(id).unwrap().as_ref(),
-                    1,
-                );
+                let candidates =
+                    self.search_layer_internal(entry, l, self.storage.get(id).unwrap().as_ref(), 1);
                 if let Some(best) = candidates.first() {
                     entry = best.id;
                 }
@@ -151,12 +147,8 @@ impl<S: VectorStorage> HnswIndex<S> {
         // Insert connections layer by layer down to 0.
         for l in (0..=level).rev() {
             let ef = self.ef_construction;
-            let candidates = self.search_layer_internal(
-                entry,
-                l,
-                self.storage.get(id).unwrap().as_ref(),
-                ef,
-            );
+            let candidates =
+                self.search_layer_internal(entry, l, self.storage.get(id).unwrap().as_ref(), ef);
             let max_m = if l == 0 { self.m_max0 } else { self.m };
             let neighbors = self.select_neighbors(candidates, max_m);
 
@@ -170,10 +162,11 @@ impl<S: VectorStorage> HnswIndex<S> {
                 let limit = if l == 0 { self.m_max0 } else { self.m };
 
                 // Add reverse edge.
-                if let Some(n_node) = self.nodes.get_mut(&n_id) {
-                    if l < n_node.layers.len() && !n_node.layers[l].contains(&id) {
-                        n_node.layers[l].push(id);
-                    }
+                if let Some(n_node) = self.nodes.get_mut(&n_id)
+                    && l < n_node.layers.len()
+                    && !n_node.layers[l].contains(&id)
+                {
+                    n_node.layers[l].push(id);
                 }
 
                 // Prune neighbor list after potential insertion.
@@ -184,10 +177,10 @@ impl<S: VectorStorage> HnswIndex<S> {
                     .cloned()
                     .unwrap_or_default();
                 let pruned = self.prune_neighbor_list(n_id, &current, limit);
-                if let Some(n_node) = self.nodes.get_mut(&n_id) {
-                    if l < n_node.layers.len() {
-                        n_node.layers[l] = pruned;
-                    }
+                if let Some(n_node) = self.nodes.get_mut(&n_id)
+                    && l < n_node.layers.len()
+                {
+                    n_node.layers[l] = pruned;
                 }
             }
         }
@@ -324,8 +317,7 @@ mod tests {
 
         let path = env::temp_dir().join("vector-db-hnsw.json");
         idx.save_to_json(&path).expect("save");
-        let loaded: HnswIndex<InMemoryStorage> =
-            HnswIndex::load_from_json(&path).expect("load");
+        let loaded: HnswIndex<InMemoryStorage> = HnswIndex::load_from_json(&path).expect("load");
         let _ = fs::remove_file(&path);
 
         let res = loaded.search(&[0.9, 0.1], 2);
@@ -516,16 +508,14 @@ where
     pub fn save_to_json<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
-        serde_json::to_writer(writer, self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize: {e}")))
+        serde_json::to_writer(writer, self).map_err(|e| io::Error::other(format!("serialize: {e}")))
     }
 
     /// Load an index previously saved with `save_to_json`.
     pub fn load_from_json<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("deserialize: {e}")))
+        serde_json::from_reader(reader).map_err(|e| io::Error::other(format!("deserialize: {e}")))
     }
 }
 
