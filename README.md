@@ -36,5 +36,3 @@ The main types are exported from the crate root:
 - `Metric` — choose `L2` or `Cosine`.
 - `InMemoryStorage`, `VectorStorage` — storage abstractions.
 
-## Notes
-- Currently single-threaded and in-memory. Concurrency, persistence, and quantization can be layered on later.
