@@ -2,6 +2,10 @@
 name = "vector-db"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A compact HNSW vector index with pluggable storage backends"
+license = "MIT"
+repository = "https://github.com/src6/vector-db"
 
 [dependencies]
 rand = "0.8"

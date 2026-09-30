@@ -116,6 +116,10 @@ impl VectorStorage for QuantizedStorage {
     fn len(&self) -> usize {
         self.codes.len()
     }
+
+    fn dim(&self) -> Option<usize> {
+        Some(self.config.dim())
+    }
 }
 
 #[cfg(test)]

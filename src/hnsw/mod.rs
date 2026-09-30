@@ -4,14 +4,14 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::path::Path;
 
-use rand::{Rng, thread_rng};
+use rand::{Rng, SeedableRng, rngs::StdRng, thread_rng};
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::distance::{cosine_distance, l2};
 use crate::storage::{InMemoryStorage, VectorStorage};
-use crate::types::{Metric, Neighbor, PointId};
+use crate::types::{IndexError, Metric, Neighbor, PointId};
 
 #[derive(Debug, Clone)]
 struct ScoredPoint {
@@ -42,7 +42,7 @@ impl Ord for ScoredPoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub layers: Vec<Vec<PointId>>, // index by layer
 }
@@ -54,12 +54,8 @@ impl Node {
     }
 }
 
-fn sample_level(m: usize) -> usize {
-    if m == 0 {
-        return 0;
-    }
+fn sample_level<R: Rng + ?Sized>(m: usize, rng: &mut R) -> usize {
     let mut level = 0;
-    let mut rng = thread_rng();
     let p = 1.0f32 / (m as f32); // decay factor; higher m -> shorter tail
     while rng.gen_range(0.0..1.0) < p {
         level += 1;
@@ -84,6 +80,9 @@ pub struct HnswIndex<S: VectorStorage = InMemoryStorage> {
     pub entry_point_level: usize,
     pub nodes: HashMap<PointId, Node>,
     pub storage: S,
+    /// When set, makes level sampling reproducible for a fixed insertion order.
+    #[serde(default)]
+    pub level_seed: Option<u64>,
 }
 
 impl<S: VectorStorage> HnswIndex<S> {
@@ -95,7 +94,41 @@ impl<S: VectorStorage> HnswIndex<S> {
         metric: Metric,
         storage: S,
     ) -> Self {
-        Self {
+        Self::try_new(m, m_max0, ef_construction, ef_search, metric, storage)
+            .expect("invalid HNSW configuration")
+    }
+
+    /// Construct an index after validating parameters.
+    pub fn try_new(
+        m: usize,
+        m_max0: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        metric: Metric,
+        storage: S,
+    ) -> Result<Self, IndexError> {
+        if m == 0 {
+            return Err(IndexError::InvalidConfiguration(
+                "m must be greater than zero",
+            ));
+        }
+        if m_max0 == 0 {
+            return Err(IndexError::InvalidConfiguration(
+                "m_max0 must be greater than zero",
+            ));
+        }
+        if ef_construction == 0 {
+            return Err(IndexError::InvalidConfiguration(
+                "ef_construction must be greater than zero",
+            ));
+        }
+        if ef_search == 0 {
+            return Err(IndexError::InvalidConfiguration(
+                "ef_search must be greater than zero",
+            ));
+        }
+
+        Ok(Self {
             m,
             m_max0,
             ef_construction,
@@ -105,7 +138,20 @@ impl<S: VectorStorage> HnswIndex<S> {
             entry_point_level: 0,
             nodes: HashMap::new(),
             storage,
-        }
+            level_seed: None,
+        })
+    }
+
+    /// Use deterministic level sampling for reproducible construction.
+    ///
+    /// The seed must be configured before the first insertion.
+    pub fn with_level_seed(mut self, seed: u64) -> Self {
+        assert!(
+            self.nodes.is_empty(),
+            "level seed must be set before insertion"
+        );
+        self.level_seed = Some(seed);
+        self
     }
 
     /// Parallel search for many queries using rayon.
@@ -122,14 +168,27 @@ impl<S: VectorStorage> HnswIndex<S> {
 
     /// Insert a vector; returns its id.
     pub fn insert(&mut self, vector: Vec<f32>) -> PointId {
+        self.try_insert(vector).expect("invalid vector")
+    }
+
+    /// Insert a vector after validating its dimension and values.
+    pub fn try_insert(&mut self, vector: Vec<f32>) -> Result<PointId, IndexError> {
+        self.validate_vector(&vector)?;
         let id = self.storage.push(vector);
-        let level = sample_level(self.m);
+        let level = match self.level_seed {
+            Some(seed) => {
+                let mut rng =
+                    StdRng::seed_from_u64(seed ^ (id as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                sample_level(self.m, &mut rng)
+            }
+            None => sample_level(self.m, &mut thread_rng()),
+        };
         let node = Node::new(level);
         self.nodes.insert(id, node);
         if self.entry_point.is_none() {
             self.entry_point = Some(id);
             self.entry_point_level = level;
-            return id;
+            return Ok(id);
         }
 
         // Greedy descent on upper layers to find an entry for layers up to `level`.
@@ -190,13 +249,24 @@ impl<S: VectorStorage> HnswIndex<S> {
             self.entry_point = Some(id);
             self.entry_point_level = level;
         }
-        id
+        Ok(id)
     }
 
-    /// Search for k nearest neighbors (squared L2 for now).
+    /// Search for k nearest neighbors.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+        self.try_search(query, k).expect("invalid query vector")
+    }
+
+    /// Search after validating the query dimension and values.
+    pub fn try_search(&self, query: &[f32], k: usize) -> Result<Vec<Neighbor>, IndexError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.storage.is_empty() {
+            self.validate_vector(query)?;
+        }
         let Some(mut entry) = self.entry_point else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         // Greedy descent on upper layers (ef = 1) to pick an entry to layer 0.
@@ -211,17 +281,36 @@ impl<S: VectorStorage> HnswIndex<S> {
         let mut results = self.search_layer_internal(entry, 0, query, self.ef_search);
         results = sort_by_distance(results);
         results.truncate(k);
-        results
+        Ok(results
             .into_iter()
             .map(|sp| Neighbor {
                 id: sp.id,
                 distance: sp.distance,
             })
-            .collect()
+            .collect())
+    }
+
+    fn validate_vector(&self, vector: &[f32]) -> Result<(), IndexError> {
+        if vector.is_empty() {
+            return Err(IndexError::EmptyVector);
+        }
+        if let Some(expected) = self.storage.dim()
+            && vector.len() != expected
+        {
+            return Err(IndexError::DimensionMismatch {
+                expected,
+                actual: vector.len(),
+            });
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(IndexError::NonFiniteValue);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::storage::{InMemoryStorage, QuantizedStorage, ScalarQuantizerConfig};
@@ -310,7 +399,8 @@ mod tests {
 
     #[test]
     fn persistence_round_trip() {
-        let mut idx = HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new());
+        let mut idx =
+            HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new()).with_level_seed(99);
         idx.insert(vec![0.0, 0.0]);
         idx.insert(vec![1.0, 0.0]);
         idx.insert(vec![0.0, 1.0]);
@@ -320,6 +410,7 @@ mod tests {
         let loaded: HnswIndex<InMemoryStorage> = HnswIndex::load_from_json(&path).expect("load");
         let _ = fs::remove_file(&path);
 
+        assert_eq!(loaded.level_seed, Some(99));
         let res = loaded.search(&[0.9, 0.1], 2);
         assert!(!res.is_empty());
     }
@@ -351,6 +442,43 @@ mod tests {
         for (i, res) in results.iter().enumerate() {
             assert_eq!(res[0].id, i);
         }
+    }
+
+    #[test]
+    fn seeded_construction_is_reproducible() {
+        let data: Vec<Vec<f32>> = (0..100).map(|i| vec![i as f32, (i % 7) as f32]).collect();
+        let build = || {
+            let mut index = HnswIndex::new(4, 8, 16, 16, Metric::L2, InMemoryStorage::new())
+                .with_level_seed(42);
+            for vector in data.iter().cloned() {
+                index.insert(vector);
+            }
+            index
+        };
+
+        let first = build();
+        let second = build();
+        assert_eq!(first.entry_point, second.entry_point);
+        assert_eq!(first.entry_point_level, second.entry_point_level);
+        assert_eq!(first.nodes, second.nodes);
+    }
+
+    #[test]
+    fn fallible_api_rejects_invalid_vectors() {
+        let mut index = HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new());
+        assert_eq!(index.try_insert(Vec::new()), Err(IndexError::EmptyVector));
+        index.try_insert(vec![0.0, 1.0]).unwrap();
+        assert_eq!(
+            index.try_insert(vec![0.0]),
+            Err(IndexError::DimensionMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            index.try_search(&[f32::NAN, 0.0], 1),
+            Err(IndexError::NonFiniteValue)
+        );
     }
 }
 
