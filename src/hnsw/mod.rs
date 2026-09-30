@@ -83,6 +83,9 @@ pub struct HnswIndex<S: VectorStorage = InMemoryStorage> {
     /// When set, makes level sampling reproducible for a fixed insertion order.
     #[serde(default)]
     pub level_seed: Option<u64>,
+    /// Logically deleted points. Tombstoned nodes remain traversable until compaction.
+    #[serde(default)]
+    deleted: HashSet<PointId>,
 }
 
 impl<S: VectorStorage> HnswIndex<S> {
@@ -139,6 +142,7 @@ impl<S: VectorStorage> HnswIndex<S> {
             nodes: HashMap::new(),
             storage,
             level_seed: None,
+            deleted: HashSet::new(),
         })
     }
 
@@ -174,6 +178,7 @@ impl<S: VectorStorage> HnswIndex<S> {
     /// Insert a vector after validating its dimension and values.
     pub fn try_insert(&mut self, vector: Vec<f32>) -> Result<PointId, IndexError> {
         self.validate_vector(&vector)?;
+        let had_active_points = self.active_len() > 0;
         let id = self.storage.push(vector);
         let level = match self.level_seed {
             Some(seed) => {
@@ -185,7 +190,7 @@ impl<S: VectorStorage> HnswIndex<S> {
         };
         let node = Node::new(level);
         self.nodes.insert(id, node);
-        if self.entry_point.is_none() {
+        if self.entry_point.is_none() || !had_active_points {
             self.entry_point = Some(id);
             self.entry_point_level = level;
             return Ok(id);
@@ -252,6 +257,71 @@ impl<S: VectorStorage> HnswIndex<S> {
         Ok(id)
     }
 
+    /// Logically delete a point while retaining its graph edges for traversal.
+    pub fn delete(&mut self, id: PointId) -> Result<(), IndexError> {
+        if !self.nodes.contains_key(&id) || self.storage.get(id).is_none() {
+            return Err(IndexError::PointNotFound { id });
+        }
+        if !self.deleted.insert(id) {
+            return Err(IndexError::PointAlreadyDeleted { id });
+        }
+        Ok(())
+    }
+
+    pub fn is_deleted(&self, id: PointId) -> bool {
+        self.deleted.contains(&id)
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn active_len(&self) -> usize {
+        self.storage.len().saturating_sub(self.deleted.len())
+    }
+
+    pub fn deleted_len(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// Rebuild active points into an empty storage backend.
+    ///
+    /// Compaction physically removes tombstones and returns an old-to-new point ID map.
+    pub fn compact_into<T: VectorStorage>(
+        &self,
+        storage: T,
+    ) -> Result<(HnswIndex<T>, HashMap<PointId, PointId>), IndexError> {
+        if !storage.is_empty() {
+            return Err(IndexError::InvalidConfiguration(
+                "compaction destination must be empty",
+            ));
+        }
+
+        let mut compacted = HnswIndex::try_new(
+            self.m,
+            self.m_max0,
+            self.ef_construction,
+            self.ef_search,
+            self.metric,
+            storage,
+        )?;
+        compacted.level_seed = self.level_seed;
+
+        let mut id_map = HashMap::with_capacity(self.active_len());
+        for old_id in 0..self.storage.len() {
+            if self.deleted.contains(&old_id) {
+                continue;
+            }
+            let vector = self
+                .storage
+                .get_owned(old_id)
+                .ok_or(IndexError::PointNotFound { id: old_id })?;
+            let new_id = compacted.try_insert(vector)?;
+            id_map.insert(old_id, new_id);
+        }
+        Ok((compacted, id_map))
+    }
+
     /// Search for k nearest neighbors.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
         self.try_search(query, k).expect("invalid query vector")
@@ -290,7 +360,7 @@ impl<S: VectorStorage> HnswIndex<S> {
             .collect())
     }
 
-    fn validate_vector(&self, vector: &[f32]) -> Result<(), IndexError> {
+    pub fn validate_vector(&self, vector: &[f32]) -> Result<(), IndexError> {
         if vector.is_empty() {
             return Err(IndexError::EmptyVector);
         }
@@ -404,6 +474,7 @@ mod tests {
         idx.insert(vec![0.0, 0.0]);
         idx.insert(vec![1.0, 0.0]);
         idx.insert(vec![0.0, 1.0]);
+        idx.delete(1).unwrap();
 
         let path = env::temp_dir().join("vector-db-hnsw.json");
         idx.save_to_json(&path).expect("save");
@@ -411,8 +482,10 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(loaded.level_seed, Some(99));
+        assert!(loaded.is_deleted(1));
         let res = loaded.search(&[0.9, 0.1], 2);
         assert!(!res.is_empty());
+        assert!(res.iter().all(|neighbor| neighbor.id != 1));
     }
 
     #[test]
@@ -480,6 +553,58 @@ mod tests {
             Err(IndexError::NonFiniteValue)
         );
     }
+
+    #[test]
+    fn deleted_points_are_traversed_but_not_returned() {
+        let mut index =
+            HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new()).with_level_seed(7);
+        for value in 0..5 {
+            index.insert(vec![value as f32, 0.0]);
+        }
+
+        index.delete(2).unwrap();
+        let results = index.search(&[2.0, 0.0], 5);
+        assert_eq!(index.total_len(), 5);
+        assert_eq!(index.active_len(), 4);
+        assert!(results.iter().all(|neighbor| neighbor.id != 2));
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            index.delete(2),
+            Err(IndexError::PointAlreadyDeleted { id: 2 })
+        );
+        assert_eq!(index.delete(99), Err(IndexError::PointNotFound { id: 99 }));
+    }
+
+    #[test]
+    fn compaction_removes_tombstones_and_returns_id_map() {
+        let mut index =
+            HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new()).with_level_seed(11);
+        for value in 0..4 {
+            index.insert(vec![value as f32, 0.0]);
+        }
+        index.delete(1).unwrap();
+
+        let (compacted, id_map) = index.compact_into(InMemoryStorage::new()).unwrap();
+        assert_eq!(compacted.total_len(), 3);
+        assert_eq!(compacted.deleted_len(), 0);
+        assert_eq!(id_map.get(&0), Some(&0));
+        assert_eq!(id_map.get(&2), Some(&1));
+        assert_eq!(id_map.get(&3), Some(&2));
+        assert!(!id_map.contains_key(&1));
+        assert_eq!(compacted.search(&[2.0, 0.0], 1)[0].id, 1);
+    }
+
+    #[test]
+    fn insertion_after_deleting_every_point_establishes_a_new_entry() {
+        let mut index =
+            HnswIndex::new(8, 16, 32, 32, Metric::L2, InMemoryStorage::new()).with_level_seed(13);
+        let old_id = index.insert(vec![0.0, 0.0]);
+        index.delete(old_id).unwrap();
+
+        let new_id = index.insert(vec![1.0, 1.0]);
+        assert_eq!(index.entry_point, Some(new_id));
+        assert_eq!(index.search(&[1.0, 1.0], 1)[0].id, new_id);
+    }
 }
 
 impl<S: VectorStorage> HnswIndex<S> {
@@ -510,7 +635,9 @@ impl<S: VectorStorage> HnswIndex<S> {
             };
             visited.insert(entry_id);
             candidate.push(Reverse(ep.clone()));
-            result.push(ep);
+            if !self.deleted.contains(&entry_id) {
+                result.push(ep);
+            }
         }
 
         while let Some(Reverse(curr)) = candidate.pop() {
@@ -531,9 +658,11 @@ impl<S: VectorStorage> HnswIndex<S> {
                             distance: d,
                         };
                         candidate.push(Reverse(sp.clone()));
-                        result.push(sp);
-                        if result.len() > ef {
-                            result.pop(); // drop the farthest
+                        if !self.deleted.contains(&n_id) {
+                            result.push(sp);
+                            if result.len() > ef {
+                                result.pop(); // drop the farthest
+                            }
                         }
                     }
                 }
@@ -609,6 +738,7 @@ impl<S: VectorStorage> HnswIndex<S> {
         };
 
         let mut uniq = neighbors.to_vec();
+        uniq.retain(|id| !self.deleted.contains(id));
         uniq.sort_unstable();
         uniq.dedup();
 

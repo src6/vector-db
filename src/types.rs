@@ -25,6 +25,8 @@ pub enum IndexError {
     EmptyVector,
     DimensionMismatch { expected: usize, actual: usize },
     NonFiniteValue,
+    PointNotFound { id: PointId },
+    PointAlreadyDeleted { id: PointId },
 }
 
 impl fmt::Display for IndexError {
@@ -36,6 +38,8 @@ impl fmt::Display for IndexError {
                 write!(f, "dimension mismatch: expected {expected}, got {actual}")
             }
             Self::NonFiniteValue => write!(f, "vectors must contain only finite values"),
+            Self::PointNotFound { id } => write!(f, "point {id} does not exist"),
+            Self::PointAlreadyDeleted { id } => write!(f, "point {id} is already deleted"),
         }
     }
 }

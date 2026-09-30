@@ -1,3 +1,4 @@
+pub mod api;
 pub mod concurrent;
 pub mod distance;
 pub mod hnsw;
@@ -5,6 +6,7 @@ pub mod segment;
 pub mod storage;
 pub mod types;
 
+pub use api::{ApiConfig, router};
 pub use concurrent::ConcurrentIndex;
 pub use distance::{cosine_distance, l2};
 pub use hnsw::HnswIndex;

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/src6/vector-db/actions/workflows/ci.yml/badge.svg)](https://github.com/src6/vector-db/actions/workflows/ci.yml)
 
-A compact HNSW vector-index library and CLI written in Rust. It supports configurable distance metrics, pluggable storage, deterministic construction, coarse-grained concurrency, and JSON persistence.
+A compact HNSW vector-index library, benchmark CLI, and HTTP service written in Rust. It supports configurable distance metrics, pluggable storage, deterministic construction, logical deletion with compaction, coarse-grained concurrency, and JSON persistence.
 
 ## Features
 
@@ -13,7 +13,9 @@ A compact HNSW vector-index library and CLI written in Rust. It supports configu
 - Persistence: save/load the graph and Serde-compatible storage representation as JSON.
 - Parallel search helpers with Rayon for batch queries.
 - Segment model: `SegmentedIndex` combines immutable + mutable segments and supports flush.
+- Logical deletion preserves graph connectivity; explicit compaction rebuilds active vectors and reports ID changes.
 - Fallible construction, insert, and search APIs validate configuration, dimensions, and finite values.
+- Versioned Axum HTTP API with single/batch insert and search, deletion, statistics, and compaction.
 - CLI demo and seeded random-data mode with reproducible graph construction.
 - CI checks formatting, Clippy with warnings denied, and the test suite on pushes and pull requests.
 
@@ -30,6 +32,9 @@ cargo run -- random --n 50 --dim 8 --k 5 --metric l2 --seed 42
 
 # Measure build time, Rayon batch-query throughput, and exact recall@k.
 cargo run --release -- benchmark --n 10000 --dim 128 --queries 100 --k 10 --seed 42
+
+# Start a local API accepting 128-dimensional cosine vectors.
+cargo run --release -- serve --dim 128 --metric cosine --port 3000
 ```
 
 Both data generation and HNSW level sampling use `--seed`, so a fixed command builds the same graph. The `random` and `benchmark` commands also accept `--m`, `--m-max0`, `--ef-construction`, and `--ef-search`.
@@ -65,6 +70,7 @@ The fallible API rejects invalid configuration, empty vectors, dimension mismatc
 
 ```text
 Library callers / CLI
+├── Axum HTTP API                versioned JSON endpoints
 ├── HnswIndex                    graph construction and ANN search
 │   └── VectorStorage
 │       ├── InMemoryStorage      full-precision vectors in memory
@@ -92,6 +98,37 @@ Library callers / CLI
 - `demo`: Inserts a small 2D set and prints neighbors for a fixed query.
 - `random`: Inserts `n` random points of dimension `dim`, runs a random query, and prints the top `k` neighbors and effective graph configuration. Parameters: `--n`, `--dim`, `--k`, `--seed`, `--metric l2|cosine`, `--m`, `--m-max0`, `--ef-construction`, and `--ef-search`.
 - `benchmark`: Uses the same data and graph parameters plus `--queries`; run it with `--release` for meaningful throughput measurements.
+- `serve`: Starts the HTTP service. The dimension, metric, seed, bind address, and HNSW parameters are fixed for the lifetime of the process.
+
+## HTTP API
+
+The server binds to `127.0.0.1:3000` by default, enforces an 8 MiB request limit, and moves index work off Tokio's async worker threads.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/health` | Liveness check |
+| `GET` | `/v1/stats` | Vector counts and effective index configuration |
+| `POST` | `/v1/vectors` | Insert one vector |
+| `POST` | `/v1/vectors/batch` | Atomically validate, then insert a batch |
+| `DELETE` | `/v1/vectors/{id}` | Logically delete a point |
+| `POST` | `/v1/search` | Search one query vector |
+| `POST` | `/v1/search/batch` | Search a query batch with Rayon |
+| `POST` | `/v1/maintenance/compact` | Rebuild without tombstones and return ID mappings |
+
+```bash
+# In a separate terminal, start a three-dimensional index for this example.
+cargo run --release -- serve --dim 3 --metric cosine
+
+curl -X POST http://127.0.0.1:3000/v1/vectors \
+  -H 'content-type: application/json' \
+  -d '{"vector":[0.1,0.2,0.3]}'
+
+curl -X POST http://127.0.0.1:3000/v1/search \
+  -H 'content-type: application/json' \
+  -d '{"vector":[0.1,0.2,0.3],"k":10}'
+```
+
+Deletion uses tombstones: deleted nodes remain traversable so removing a bridge does not disconnect search, but they are excluded from results. Compaction physically removes them under the write lock. Because compaction assigns dense IDs, clients must consume the returned `old_id` → `new_id` mapping.
 
 ## Current scope
 
@@ -101,7 +138,8 @@ This is a compact learning implementation, not a drop-in replacement for a distr
 - JSON is intended for transparent, portable snapshots rather than compact or crash-atomic persistence. For `MmapStorage`, JSON stores the mapped file path and metadata, not the vector bytes; the original backing file must remain available.
 - `MmapStorage` has a fixed capacity and currently panics when that capacity is exceeded through the infallible `VectorStorage::push` interface.
 - Scalar quantization dequantizes vectors before distance evaluation. It reduces stored vector size but is not a SIMD-optimized quantized distance kernel.
-- There is no delete/update path, write-ahead log, online compaction, network service, authentication, or stable on-disk format guarantee.
+- The HTTP service is in-memory and has no authentication; keep the default loopback binding unless it is placed behind an appropriate trusted gateway.
+- There is no in-place vector update, write-ahead log, online/background compaction, or stable on-disk format guarantee.
 
 These boundaries keep the implementation focused on the indexing, storage, concurrency, and evaluation mechanics rather than presenting it as a distributed database.
 
@@ -110,6 +148,7 @@ These boundaries keep the implementation focused on the indexing, storage, concu
 | Area | Source |
 | --- | --- |
 | HNSW level sampling, beam search, neighbor pruning, and persistence | [`src/hnsw/mod.rs`](src/hnsw/mod.rs) |
+| HTTP routing, validation, errors, and lifecycle tests | [`src/api.rs`](src/api.rs) |
 | L2 and cosine distance | [`src/distance.rs`](src/distance.rs) |
 | i8 scalar quantization | [`src/storage/quantized.rs`](src/storage/quantized.rs) |
 | In-memory and mmap storage | [`src/storage`](src/storage) |

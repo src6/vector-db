@@ -4,7 +4,9 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
-use vector_db::{HnswIndex, InMemoryStorage, Metric, cosine_distance, l2};
+use vector_db::{
+    ApiConfig, ConcurrentIndex, HnswIndex, InMemoryStorage, Metric, cosine_distance, l2, router,
+};
 
 #[derive(Parser)]
 #[command(name = "vector-db", about = "Demo CLI for the HNSW index")]
@@ -21,6 +23,8 @@ enum Commands {
     Random(RandomArgs),
     /// Measure build time, parallel search throughput, and recall
     Benchmark(BenchmarkArgs),
+    /// Run the HTTP vector-search service
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
@@ -63,6 +67,37 @@ struct BenchmarkArgs {
     queries: usize,
 }
 
+#[derive(Args)]
+struct ServeArgs {
+    /// Interface or hostname to bind
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// TCP port to bind
+    #[arg(long, default_value_t = 3000)]
+    port: u16,
+    /// Required vector dimension
+    #[arg(long, default_value_t = 128, value_parser = parse_positive_usize)]
+    dim: usize,
+    /// Seed used for deterministic HNSW level sampling
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Metric: l2 or cosine
+    #[arg(long, default_value = "l2", value_enum)]
+    metric: MetricArg,
+    /// Maximum neighbors per upper graph layer
+    #[arg(long, default_value_t = 16, value_parser = parse_positive_usize)]
+    m: usize,
+    /// Maximum neighbors at the base graph layer
+    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
+    m_max0: usize,
+    /// Candidate-list size used while constructing the graph
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+    ef_construction: usize,
+    /// Candidate-list size used while searching the graph
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+    ef_search: usize,
+}
+
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -88,13 +123,56 @@ impl From<MetricArg> for Metric {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Demo => run_demo(),
         Commands::Random(args) => run_random(args),
         Commands::Benchmark(args) => run_benchmark(args),
+        Commands::Serve(args) => {
+            if let Err(error) = run_server(args).await {
+                eprintln!("server error: {error}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+async fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let metric = args.metric.into();
+    let config = ApiConfig {
+        dimension: args.dim,
+        metric,
+        m: args.m,
+        m_max0: args.m_max0,
+        ef_construction: args.ef_construction,
+        ef_search: args.ef_search,
+    };
+    let index = HnswIndex::try_new(
+        config.m,
+        config.m_max0,
+        config.ef_construction,
+        config.ef_search,
+        config.metric,
+        InMemoryStorage::new(),
+    )?
+    .with_level_seed(args.seed);
+    let app = router(ConcurrentIndex::new(index), config);
+    let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
+    println!(
+        "vector-db API listening on http://{} (dimension={}, metric={metric:?})",
+        listener.local_addr()?,
+        args.dim,
+    );
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                eprintln!("failed to listen for shutdown signal: {error}");
+            }
+        })
+        .await?;
+    Ok(())
 }
 
 fn run_demo() {

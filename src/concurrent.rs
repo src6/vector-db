@@ -1,7 +1,8 @@
 use crate::hnsw::HnswIndex;
-use crate::storage::VectorStorage;
-use crate::types::{Neighbor, PointId};
+use crate::storage::{InMemoryStorage, VectorStorage};
+use crate::types::{IndexError, Neighbor, PointId};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Thread-safe wrapper around `HnswIndex` using coarse-grained locking.
@@ -25,6 +26,35 @@ where
         guard.insert(vector)
     }
 
+    pub fn try_insert(&self, vector: Vec<f32>) -> Result<PointId, IndexError> {
+        let mut guard = self.inner.write().expect("lock poisoned");
+        guard.try_insert(vector)
+    }
+
+    /// Validate a whole batch before inserting it under one write lock.
+    pub fn try_insert_batch(&self, vectors: Vec<Vec<f32>>) -> Result<Vec<PointId>, IndexError> {
+        let mut guard = self.inner.write().expect("lock poisoned");
+        let expected_dimension = guard
+            .storage
+            .dim()
+            .or_else(|| vectors.first().map(Vec::len));
+        for vector in &vectors {
+            guard.validate_vector(vector)?;
+            if let Some(expected) = expected_dimension
+                && vector.len() != expected
+            {
+                return Err(IndexError::DimensionMismatch {
+                    expected,
+                    actual: vector.len(),
+                });
+            }
+        }
+        vectors
+            .into_iter()
+            .map(|vector| guard.try_insert(vector))
+            .collect()
+    }
+
     /// Insert a batch of vectors in parallel, leveraging coarse lock per insert.
     pub fn insert_batch_parallel<I>(&self, vectors: I) -> Vec<PointId>
     where
@@ -36,6 +66,27 @@ where
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
         let guard = self.inner.read().expect("lock poisoned");
         guard.search(query, k)
+    }
+
+    pub fn try_search(&self, query: &[f32], k: usize) -> Result<Vec<Neighbor>, IndexError> {
+        let guard = self.inner.read().expect("lock poisoned");
+        guard.try_search(query, k)
+    }
+
+    pub fn try_search_batch_parallel(
+        &self,
+        queries: Vec<Vec<f32>>,
+        k: usize,
+    ) -> Result<Vec<Vec<Neighbor>>, IndexError> {
+        queries
+            .into_par_iter()
+            .map(|query| self.try_search(&query, k))
+            .collect()
+    }
+
+    pub fn delete(&self, id: PointId) -> Result<(), IndexError> {
+        let mut guard = self.inner.write().expect("lock poisoned");
+        guard.delete(id)
     }
 
     pub fn search_batch_parallel<I>(&self, queries: I, k: usize) -> Vec<Vec<Neighbor>>
@@ -53,8 +104,34 @@ where
         guard.storage.len()
     }
 
+    pub fn active_len(&self) -> usize {
+        let guard = self.inner.read().expect("lock poisoned");
+        guard.active_len()
+    }
+
+    pub fn deleted_len(&self) -> usize {
+        let guard = self.inner.read().expect("lock poisoned");
+        guard.deleted_len()
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let guard = self.inner.read().expect("lock poisoned");
+        (guard.total_len(), guard.active_len(), guard.deleted_len())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl ConcurrentIndex<InMemoryStorage> {
+    /// Rebuild the index without tombstones while holding the write lock.
+    pub fn compact(&self) -> Result<(usize, HashMap<PointId, PointId>), IndexError> {
+        let mut guard = self.inner.write().expect("lock poisoned");
+        let removed = guard.deleted_len();
+        let (compacted, id_map) = guard.compact_into(InMemoryStorage::new())?;
+        *guard = compacted;
+        Ok((removed, id_map))
     }
 }
 
@@ -98,5 +175,20 @@ mod tests {
         let queries: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32 + 0.1, 0.0]).collect();
         let res = shared.search_batch_parallel(queries, 1);
         assert_eq!(res.len(), 10);
+    }
+
+    #[test]
+    fn invalid_batch_is_rejected_before_any_insert() {
+        let index = HnswIndex::new(8, 16, 16, 16, Metric::L2, InMemoryStorage::new());
+        let shared = ConcurrentIndex::new(index);
+        let result = shared.try_insert_batch(vec![vec![1.0, 2.0], vec![3.0]]);
+        assert_eq!(
+            result,
+            Err(IndexError::DimensionMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert_eq!(shared.len(), 0);
     }
 }
