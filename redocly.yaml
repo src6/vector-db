@@ -1,0 +1,6 @@
+extends:
+  - recommended
+
+rules:
+  # Health, stats, and no-body maintenance calls have no expected 4xx outcome.
+  operation-4xx-response: off

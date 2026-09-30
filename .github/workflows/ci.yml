@@ -17,3 +17,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Install Node.js for API linting
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Lint OpenAPI specification
+        run: npx --yes @redocly/cli@2.56.1 lint openapi.yaml

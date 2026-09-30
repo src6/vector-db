@@ -1,8 +1,12 @@
 # vector-db
 
 [![CI](https://github.com/src6/vector-db/actions/workflows/ci.yml/badge.svg)](https://github.com/src6/vector-db/actions/workflows/ci.yml)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A compact HNSW vector-index library, benchmark CLI, and HTTP service written in Rust. It supports configurable distance metrics, pluggable storage, deterministic construction, logical deletion with compaction, coarse-grained concurrency, and JSON persistence.
+A focused, single-node HNSW vector search engine written in Rust. The project combines a reusable library, reproducible benchmark CLI, and versioned Axum API with pluggable storage, logical deletion, compaction, and JSON snapshots.
+
+[Quickstart](#quickstart) · [Library usage](#library-usage) · [HTTP API](#http-api) · [OpenAPI specification](openapi.yaml) · [Architecture](#architecture) · [Current scope](#current-scope)
 
 ## Features
 
@@ -102,7 +106,7 @@ Library callers / CLI
 
 ## HTTP API
 
-The server binds to `127.0.0.1:3000` by default, enforces an 8 MiB request limit, and moves index work off Tokio's async worker threads.
+The server binds to `127.0.0.1:3000` by default, enforces an 8 MiB request limit, and moves index work off Tokio's async worker threads. The complete machine-readable contract is available in [`openapi.yaml`](openapi.yaml).
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -132,7 +136,7 @@ Deletion uses tombstones: deleted nodes remain traversable so removing a bridge 
 
 ## Current scope
 
-This is a compact learning implementation, not a drop-in replacement for a distributed production vector database. In particular:
+This is a focused single-node implementation, not a drop-in replacement for a distributed production vector database. In particular:
 
 - `ConcurrentIndex` deliberately uses one coarse `RwLock`; searches can run together, while each insert holds the write lock and therefore serializes writers.
 - JSON is intended for transparent, portable snapshots rather than compact or crash-atomic persistence. For `MmapStorage`, JSON stores the mapped file path and metadata, not the vector bytes; the original backing file must remain available.
@@ -155,6 +159,7 @@ These boundaries keep the implementation focused on the indexing, storage, concu
 | Immutable/mutable segmentation | [`src/segment.rs`](src/segment.rs) |
 | Rayon batch queries and coarse `RwLock` concurrency | [`src/concurrent.rs`](src/concurrent.rs) |
 | Reproducible CLI datasets and benchmarks | [`src/main.rs`](src/main.rs) |
+| OpenAPI 3.1 service contract | [`openapi.yaml`](openapi.yaml) |
 
 ## Development
 
@@ -162,6 +167,7 @@ These boundaries keep the implementation focused on the indexing, storage, concu
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+npx --yes @redocly/cli@2.56.1 lint openapi.yaml
 ```
 
-The same checks run in [GitHub Actions](.github/workflows/ci.yml). The project is available under the [MIT License](LICENSE).
+The same checks run in [GitHub Actions](.github/workflows/ci.yml). See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. The project is available under the [MIT License](LICENSE).
